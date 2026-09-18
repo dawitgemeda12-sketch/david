@@ -1,0 +1,23 @@
+node_modules
+# Keep environment variables out of version control
+.env
+.env.production
+.env.staging
+
+# Build artifacts
+dist
+
+# Uploaded files (local storage driver, dev only) — never commit real user images
+uploads/*
+!uploads/.gitkeep
+
+# Logs
+*.log
+dev-server.log
+
+# IDE
+.vscode
+.idea
+
+# Coverage
+coverage

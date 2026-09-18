@@ -1,0 +1,493 @@
+// Stylish V2 — Production PostgreSQL schema (Prisma)
+//
+// Design principles:
+// - Every user-owned table carries a `userId` foreign key with a
+//   restrictive relation, enforced additionally at the service layer
+//   (WHERE userId = currentUser.id) so a user can NEVER read/write
+//   another user's private data (see AUTH.md / SECURITY.md).
+// - Soft deletion (`deletedAt`) is used for user-authored content that
+//   benefits from recovery/audit (wardrobe items, outfits); hard
+//   deletion is used for session/token records and on account deletion.
+// - All monetary values use ETB by default (Ethiopia launch market).
+// - Timestamps (`createdAt`, `updatedAt`) are present on all core tables.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================================
+// USERS & AUTH
+// ==========================================================
+
+enum AuthProvider {
+  EMAIL
+  GOOGLE
+  APPLE
+  GUEST
+}
+
+model User {
+  id              String    @id @default(uuid())
+  email           String?   @unique
+  name            String
+  passwordHash    String? // bcrypt hash; null for OAuth/guest accounts
+  authProvider    AuthProvider @default(EMAIL)
+  emailVerified   Boolean   @default(false)
+  isGuest         Boolean   @default(false)
+  isActive        Boolean   @default(true) // soft-disable (moderation/security)
+  isAdmin         Boolean   @default(false)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime? // soft delete marker; account deletion anonymizes + sets this
+
+  profile         Profile?
+  identities      AuthIdentity[]
+  sessions        Session[]
+  passwordResets  PasswordResetToken[]
+  wardrobeItems   WardrobeItem[]
+  outfits         Outfit[]
+  plans           Plan[]
+  preferences     StylePreference?
+  notifications   Notification[]
+  notifPrefs      NotificationPreference?
+  aiConversations AiConversation[]
+  shopGapResults  ShopGapRecommendation[]
+  auditLogs       AuditLog[]
+  communityPosts  CommunityPost[]
+  comments        Comment[]
+  likes           Like[]
+  reportsFiled    Report[]           @relation("ReportsFiled")
+  reportsAgainst  Report[]           @relation("ReportsAgainst")
+  blocksInitiated Block[]            @relation("BlocksInitiated")
+  blockedBy       Block[]            @relation("BlockedBy")
+  deviceTokens    DeviceToken[]
+
+  @@index([email])
+}
+
+// External identity link (Google/Apple) kept separate from User so a
+// single account can (in the future) link multiple providers.
+model AuthIdentity {
+  id             String       @id @default(uuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider       AuthProvider
+  providerUserId String // e.g. Google "sub" claim
+  createdAt      DateTime     @default(now())
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+}
+
+// Refresh-token session record — enables rotation & revocation.
+model Session {
+  id                String    @id @default(uuid())
+  userId            String
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash  String // SHA-256 hash of the refresh token, never store raw token
+  userAgent         String?
+  ipAddress         String?
+  createdAt         DateTime  @default(now())
+  expiresAt         DateTime
+  revokedAt         DateTime?
+  replacedBySession String? // token-rotation chain, for reuse-detection
+
+  @@index([userId])
+  @@index([refreshTokenHash])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String // SHA-256 hash of the reset token sent via email
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  @@index([userId])
+  @@index([tokenHash])
+}
+
+model Profile {
+  id                    String   @id @default(uuid())
+  userId                String   @unique
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  username              String?  @unique
+  profileImageUrl       String?
+  gender                String? // Women, Men, Children, Other
+  city                  String   @default("Addis Ababa")
+  country               String   @default("Ethiopia")
+  currency              String   @default("ETB")
+  monthlyBudget         Decimal? @db.Decimal(12, 2)
+  sizeInfo              String?
+  aiPersonalizationOn   Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+model StylePreference {
+  id                String   @id @default(uuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  favoriteColors    String[] // Postgres text[]
+  dislikedColors    String[]
+  preferredOccasions String[]
+  preferredStyles   String[] // e.g. Minimalist, Streetwear, Classic
+  formalityBias     String? // Casual, Smart Casual, Formal
+  updatedAt         DateTime @updatedAt
+}
+
+// ==========================================================
+// WARDROBE
+// ==========================================================
+
+model WardrobeCategory {
+  id            String         @id @default(uuid())
+  name          String         @unique // Tops, Shirts, Dresses, Shoes, ...
+  slotGroup     String // Top | Bottom | Shoes | Outerwear | Bag | Accessories | Other
+  sortOrder     Int            @default(0)
+  wardrobeItems WardrobeItem[]
+}
+
+model WardrobeItem {
+  id              String    @id @default(uuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name            String
+  categoryId      String?
+  category        WardrobeCategory? @relation(fields: [categoryId], references: [id])
+  categoryName    String // denormalized snapshot for resilience if category renamed
+  subcategory     String?
+  color           String?
+  secondaryColor  String?
+  pattern         String?
+  material        String?
+  style           String?
+  seasons         String[]
+  occasions       String[]
+  formality       String?
+  brand           String?
+  size            String?
+  purchaseDate    DateTime?
+  purchasePriceEtb Decimal? @db.Decimal(12, 2)
+  condition       String?
+  isFavorite      Boolean   @default(false)
+  notes           String?
+  tags            String[]
+  isArchived      Boolean   @default(false)
+  wearCount       Int       @default(0)
+  lastWornAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime? // soft delete
+
+  images          WardrobeImage[]
+  outfitItems     OutfitItem[]
+
+  @@index([userId])
+  @@index([userId, categoryName])
+  @@index([userId, isArchived])
+}
+
+// Image metadata + secure object-storage reference. The raw binary
+// lives in object storage (e.g. S3-compatible bucket); Postgres only
+// stores the reference + processing metadata, per architecture rules.
+model WardrobeImage {
+  id              String       @id @default(uuid())
+  wardrobeItemId  String
+  wardrobeItem    WardrobeItem @relation(fields: [wardrobeItemId], references: [id], onDelete: Cascade)
+  storageKey      String // object storage key/path (never a public URL)
+  originalMime    String
+  width           Int?
+  height          Int?
+  sizeBytes       Int
+  backgroundRemoved Boolean    @default(false)
+  isPrimary       Boolean      @default(true)
+  createdAt       DateTime     @default(now())
+
+  @@index([wardrobeItemId])
+}
+
+// ==========================================================
+// OUTFITS
+// ==========================================================
+
+model Outfit {
+  id            String       @id @default(uuid())
+  userId        String
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  occasion      String?
+  weather       String?
+  notes         String?
+  isFavorite    Boolean      @default(false)
+  createdByAi   Boolean      @default(false)
+  coverImageKey String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  deletedAt     DateTime?
+
+  items         OutfitItem[]
+  plans         Plan[]
+
+  @@index([userId])
+}
+
+model OutfitItem {
+  id             String       @id @default(uuid())
+  outfitId       String
+  outfit         Outfit       @relation(fields: [outfitId], references: [id], onDelete: Cascade)
+  wardrobeItemId String
+  wardrobeItem   WardrobeItem @relation(fields: [wardrobeItemId], references: [id], onDelete: Cascade)
+  slot           String // Top, Bottom, Shoes, Outerwear, Bag, Accessories
+
+  @@index([outfitId])
+  @@index([wardrobeItemId])
+}
+
+// ==========================================================
+// PLANNING
+// ==========================================================
+
+model Plan {
+  id               String   @id @default(uuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  outfitId         String
+  outfit           Outfit   @relation(fields: [outfitId], references: [id], onDelete: Cascade)
+  date             DateTime @db.Date
+  occasion         String?
+  notes            String?
+  reminderEnabled  Boolean  @default(false)
+  reminderMinutesBefore Int @default(60)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([userId, date]) // one plan per user per day, matches app UX
+  @@index([userId])
+}
+
+// ==========================================================
+// SHOP THE GAP / RETAILERS
+// ==========================================================
+
+model Retailer {
+  id          String    @id @default(uuid())
+  name        String
+  city        String    @default("Addis Ababa")
+  country     String    @default("Ethiopia")
+  websiteUrl  String?
+  isVerified  Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+
+  products    Product[]
+}
+
+model Product {
+  id            String   @id @default(uuid())
+  retailerId    String
+  retailer      Retailer @relation(fields: [retailerId], references: [id], onDelete: Cascade)
+  name          String
+  category      String
+  color         String?
+  size          String?
+  priceEtb      Decimal  @db.Decimal(12, 2)
+  isAvailable   Boolean  @default(true)
+  productUrl    String?
+  imageUrl      String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  recommendations ShopGapRecommendation[]
+
+  @@index([category])
+  @@index([retailerId])
+}
+
+// Persisted result of a Shop-the-Gap analysis run for a user — enables
+// history, caching, and "why we suggested this" transparency.
+model ShopGapRecommendation {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId   String?
+  product     Product? @relation(fields: [productId], references: [id])
+  gapCategory String // e.g. "Jackets"
+  reason      String // human-readable rationale, never fabricated
+  createdAt   DateTime @default(now())
+  dismissedAt DateTime?
+
+  @@index([userId])
+}
+
+// ==========================================================
+// AI
+// ==========================================================
+
+model AiConversation {
+  id        String      @id @default(uuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  messages  AiMessage[]
+
+  @@index([userId])
+}
+
+model AiMessage {
+  id             String         @id @default(uuid())
+  conversationId String
+  conversation   AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String // 'user' | 'assistant' | 'system'
+  content        String
+  // Structured references, never fabricated — points to real rows only.
+  referencedWardrobeItemIds String[]
+  referencedProductIds      String[]
+  providerModel  String? // e.g. "claude-3-5-sonnet" — never store API keys here
+  createdAt      DateTime       @default(now())
+
+  @@index([conversationId])
+}
+
+// ==========================================================
+// NOTIFICATIONS
+// ==========================================================
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String
+  type      String // plan_reminder | weather | gap | system
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([userId, isRead])
+}
+
+model NotificationPreference {
+  id                    String  @id @default(uuid())
+  userId                String  @unique
+  user                  User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pushEnabled           Boolean @default(true)
+  planReminders         Boolean @default(true)
+  weatherTips           Boolean @default(true)
+  wardrobeGapAlerts     Boolean @default(true)
+  updatedAt             DateTime @updatedAt
+}
+
+// Device push token registration (for future FCM/APNs push delivery).
+model DeviceToken {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token      String   @unique
+  platform   String // android | ios | web
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ==========================================================
+// COMMUNITY (foundation)
+// ==========================================================
+
+model CommunityPost {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  outfitId   String?
+  imageKey   String?
+  caption    String    @default("")
+  isRemoved  Boolean   @default(false) // moderation action
+  createdAt  DateTime  @default(now())
+
+  comments   Comment[]
+  likes      Like[]
+  reports    Report[]
+
+  @@index([userId])
+}
+
+model Comment {
+  id        String        @id @default(uuid())
+  postId    String
+  post      CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  body      String
+  isRemoved Boolean       @default(false)
+  createdAt DateTime      @default(now())
+
+  @@index([postId])
+}
+
+model Like {
+  id        String        @id @default(uuid())
+  postId    String
+  post      CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime      @default(now())
+
+  @@unique([postId, userId])
+  @@index([postId])
+}
+
+model Report {
+  id           String        @id @default(uuid())
+  postId       String?
+  post         CommunityPost? @relation(fields: [postId], references: [id], onDelete: Cascade)
+  reporterId   String
+  reporter     User          @relation("ReportsFiled", fields: [reporterId], references: [id], onDelete: Cascade)
+  reportedUserId String?
+  reportedUser User?         @relation("ReportsAgainst", fields: [reportedUserId], references: [id], onDelete: Cascade)
+  reason       String
+  status       String        @default("open") // open | reviewed | dismissed | actioned
+  createdAt    DateTime      @default(now())
+
+  @@index([status])
+}
+
+model Block {
+  id           String   @id @default(uuid())
+  blockerId    String
+  blocker      User     @relation("BlocksInitiated", fields: [blockerId], references: [id], onDelete: Cascade)
+  blockedId    String
+  blocked      User     @relation("BlockedBy", fields: [blockedId], references: [id], onDelete: Cascade)
+  createdAt    DateTime @default(now())
+
+  @@unique([blockerId, blockedId])
+}
+
+// ==========================================================
+// SECURITY / AUDIT
+// ==========================================================
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String // e.g. "login_success", "login_failed", "wardrobe_item_deleted"
+  entityType String?
+  entityId   String?
+  ipAddress  String?
+  metadata   Json?  // never store passwords/tokens/secrets here
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+}
